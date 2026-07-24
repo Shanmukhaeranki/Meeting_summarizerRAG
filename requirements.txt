@@ -1,0 +1,6 @@
+groq
+streamlit
+python-dotenv
+sentence-transformers
+numpy
+yt-dlp
