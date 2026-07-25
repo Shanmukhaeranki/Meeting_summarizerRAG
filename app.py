@@ -1,5 +1,5 @@
 import streamlit as st
-from groq import Groq
+from groq import Groq, RateLimitError
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 import numpy as np
@@ -20,6 +20,18 @@ def load_embedder():
 
 
 # ---------- HELPERS ----------
+def call_groq_with_retry(client, max_retries=5, **kwargs):
+    """Calls Groq's API with automatic retry + exponential backoff on rate limits."""
+    for attempt in range(max_retries):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except RateLimitError:
+            wait_time = 10 * (attempt + 1)  # 10s, 20s, 30s, 40s, 50s
+            st.warning(f"Rate limit hit — waiting {wait_time}s before retrying...")
+            time.sleep(wait_time)
+    raise Exception("Groq API rate limit exceeded after multiple retries.")
+
+
 def chunk_text(chunks, max_words=800):
     groups = []
     current = []
@@ -56,7 +68,8 @@ or removing any factual content.
 Transcript:
 {raw_text}
 """
-    resp = client.chat.completions.create(
+    resp = call_groq_with_retry(
+        client,
         model="llama-3.3-70b-versatile",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.2,
@@ -70,7 +83,7 @@ def clean_full_transcript(chunks, client):
     progress = st.progress(0, text="Cleaning transcript...")
     for i, block in enumerate(raw_blocks):
         cleaned_blocks.append(clean_transcript_chunk(block, client))
-        time.sleep(2)  # avoid Groq free-tier rate limit
+        time.sleep(3)
         progress.progress((i + 1) / max(len(raw_blocks), 1), text=f"Cleaning section {i+1}/{len(raw_blocks)}")
     progress.empty()
     return cleaned_blocks
@@ -92,13 +105,14 @@ Also list any decisions made. Be concise — this is one part of a longer meetin
 Transcript portion:
 {segment}
 """
-        resp = client.chat.completions.create(
+        resp = call_groq_with_retry(
+            client,
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": map_prompt}],
             temperature=0.3,
         )
         partial_summaries.append(resp.choices[0].message.content)
-        time.sleep(2)  # avoid Groq free-tier rate limit
+        time.sleep(3)
         progress.progress((i + 1) / max(len(cleaned_blocks), 1), text=f"Summarized section {i+1}/{len(cleaned_blocks)}")
 
     progress.empty()
@@ -118,7 +132,8 @@ Remove duplicate points across parts. Keep it concise and non-repetitive.
 Partial summaries:
 {combined}
 """
-    final = client.chat.completions.create(
+    final = call_groq_with_retry(
+        client,
         model="llama-3.3-70b-versatile",
         messages=[{"role": "user", "content": reduce_prompt}],
         temperature=0.3,
@@ -187,7 +202,8 @@ Context:
 
 Question: {question}
 """
-        qa_response = client.chat.completions.create(
+        qa_response = call_groq_with_retry(
+            client,
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": qa_prompt}],
             temperature=0.2,
