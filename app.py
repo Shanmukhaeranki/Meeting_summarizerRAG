@@ -18,7 +18,6 @@ def load_embedder():
     return SentenceTransformer("all-MiniLM-L6-v2")
 
 
-
 # ---------- HELPERS ----------
 def chunk_text(chunks, max_words=800):
     """Group small transcript segments into larger text blocks."""
@@ -38,7 +37,7 @@ def chunk_text(chunks, max_words=800):
 
 
 def transcribe_with_groq(filepath, client):
-    """Transcribe audio using Groq's hosted Whisper API (fast, no local CPU load)."""
+    """Transcribe audio using Groq's hosted Whisper API."""
     with open(filepath, "rb") as audio_file:
         transcription = client.audio.transcriptions.create(
             file=audio_file,
@@ -47,21 +46,52 @@ def transcribe_with_groq(filepath, client):
         )
     chunks = [seg["text"].strip() for seg in transcription.segments]
     transcript = " ".join(chunks)
-    language = transcription.language
-    return chunks, transcript, language
+    return chunks, transcript, transcription.language
 
 
-def summarize_long_transcript(chunks, client):
-    """Map-reduce summarization: summarize chunks individually, then combine."""
-    segments = chunk_text(chunks, max_words=800)
+def clean_transcript_chunk(raw_text, client):
+    """NEW: Transcript Cleanup module — fixes disfluencies/ASR errors without changing meaning."""
+    prompt = f"""Clean this raw meeting transcript: fix disfluencies, punctuation,
+and obvious ASR transcription errors, without changing the meaning
+or removing any factual content.
 
-    # MAP step
+Transcript:
+{raw_text}
+"""
+    resp = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+    )
+    return resp.choices[0].message.content
+
+
+def clean_full_transcript(chunks, client):
+    """Runs cleanup once per meeting, in ~800-word blocks, before summarization."""
+    raw_blocks = chunk_text(chunks, max_words=800)
+    cleaned_blocks = []
+    progress = st.progress(0, text="Cleaning transcript...")
+    for i, block in enumerate(raw_blocks):
+        cleaned_blocks.append(clean_transcript_chunk(block, client))
+        progress.progress((i + 1) / max(len(raw_blocks), 1), text=f"Cleaning section {i+1}/{len(raw_blocks)}")
+    progress.empty()
+    return cleaned_blocks  # already chunked at ~800 words, reused directly by summarization
+
+
+def summarize_long_transcript(cleaned_blocks, client):
+    """Map-reduce summarization over the CLEANED transcript blocks."""
+    # MAP step — now with explicit chain-of-thought reasoning for action items
     partial_summaries = []
     progress = st.progress(0, text="Summarizing meeting sections...")
-    for i, segment in enumerate(segments):
+    for i, segment in enumerate(cleaned_blocks):
         map_prompt = f"""Summarize this portion of a meeting transcript.
-List any decisions made and any action items with owner/deadline if mentioned.
-Be concise — this is one part of a longer meeting.
+
+First identify any sentences describing a task, commitment, or
+follow-up. Then, for each one, determine who is responsible and
+whether a deadline was stated. Finally, list only confirmed
+action items in the format: - [Owner]: [Task] ([Deadline if any]).
+
+Also list any decisions made. Be concise — this is one part of a longer meeting.
 
 Transcript portion:
 {segment}
@@ -72,17 +102,20 @@ Transcript portion:
             temperature=0.3,
         )
         partial_summaries.append(resp.choices[0].message.content)
-        progress.progress((i + 1) / max(len(segments), 1), text=f"Summarized section {i+1}/{len(segments)}")
+        progress.progress((i + 1) / max(len(cleaned_blocks), 1), text=f"Summarized section {i+1}/{len(cleaned_blocks)}")
 
     progress.empty()
 
-    # REDUCE step
+    # REDUCE step — now with explicit Markdown formatting instruction
     combined = "\n\n".join(f"Part {i+1}:\n{s}" for i, s in enumerate(partial_summaries))
     reduce_prompt = f"""You are given summaries of consecutive parts of one meeting.
 Combine them into a single structured summary with exactly these sections:
 1. Overall Summary (3-5 sentences)
 2. Key Decisions Made
 3. Action Items (with owner and deadline where mentioned)
+
+Format your response in Markdown, using a header for each section
+and bullet points for decisions and action items.
 
 Remove duplicate points across parts. Keep it concise and non-repetitive.
 
@@ -94,7 +127,7 @@ Partial summaries:
         messages=[{"role": "user", "content": reduce_prompt}],
         temperature=0.3,
     )
-    return final.choices[0].message.content, len(segments)
+    return final.choices[0].message.content, len(cleaned_blocks)
 
 
 # ---------- MAIN APP ----------
@@ -106,30 +139,42 @@ if uploaded_file is not None:
 
     client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-    # --- Transcription (Groq hosted Whisper) ---
+    # --- Stage 1: Transcription ---
     with st.spinner("Transcribing audio..."):
-        chunks, transcript, language = transcribe_with_groq("temp_audio.mp3", client)
+        chunks, raw_transcript, language = transcribe_with_groq("temp_audio.mp3", client)
 
-    st.subheader("Transcript")
-    with st.expander("Show full transcript"):
-        st.write(transcript)
+    st.subheader("Raw Transcript")
+    with st.expander("Show raw transcript"):
+        st.write(raw_transcript)
     st.caption(f"Detected language: {language} | {len(chunks)} raw segments")
 
-    # --- Summarization (map-reduce) ---
+    # --- Stage 2: Transcript Cleanup (NEW) ---
+    with st.spinner("Cleaning transcript..."):
+        cleaned_blocks = clean_full_transcript(chunks, client)
+        cleaned_transcript = " ".join(cleaned_blocks)
+
+    st.subheader("Cleaned Transcript")
+    with st.expander("Show cleaned transcript"):
+        st.write(cleaned_transcript)
+    st.caption("Disfluencies, punctuation, and obvious ASR errors corrected via a dedicated LLM cleanup pass.")
+
+    # --- Stage 3: Summarization (map-reduce, on cleaned transcript) ---
     with st.spinner("Generating structured summary..."):
-        summary, num_segments = summarize_long_transcript(chunks, client)
+        summary, num_segments = summarize_long_transcript(cleaned_blocks, client)
 
     st.caption(f"Processed transcript in {num_segments} segment(s) using map-reduce summarization.")
     st.subheader("Summary")
-    st.write(summary)
+    st.markdown(summary)
 
-    # --- RAG Q&A ---
-    rag_chunks = chunk_text(chunks, max_words=150)  # smaller chunks for precise retrieval
+    # --- Stage 4: RAG Q&A (retrieval still uses cleaned transcript for better chunk quality) ---
+    rag_chunks = chunk_text(cleaned_transcript.split(". "), max_words=150) if False else chunk_text(
+        [c for c in cleaned_transcript.split(". ")], max_words=150
+    )
     embedder = load_embedder()
     chunk_embeddings = embedder.encode(rag_chunks)
 
     st.subheader("Ask a question about this meeting")
-    question = st.text_input("e.g. What is the meeting about?")
+    question = st.text_input("e.g. What did we decide about the budget?")
 
     if question:
         question_embedding = embedder.encode([question])[0]
