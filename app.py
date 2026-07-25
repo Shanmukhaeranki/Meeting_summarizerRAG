@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 import numpy as np
 import os
+import time
 
 load_dotenv()
 
@@ -20,7 +21,6 @@ def load_embedder():
 
 # ---------- HELPERS ----------
 def chunk_text(chunks, max_words=800):
-    """Group small transcript segments into larger text blocks."""
     groups = []
     current = []
     word_count = 0
@@ -37,7 +37,6 @@ def chunk_text(chunks, max_words=800):
 
 
 def transcribe_with_groq(filepath, client):
-    """Transcribe audio using Groq's hosted Whisper API."""
     with open(filepath, "rb") as audio_file:
         transcription = client.audio.transcriptions.create(
             file=audio_file,
@@ -50,7 +49,6 @@ def transcribe_with_groq(filepath, client):
 
 
 def clean_transcript_chunk(raw_text, client):
-    """NEW: Transcript Cleanup module — fixes disfluencies/ASR errors without changing meaning."""
     prompt = f"""Clean this raw meeting transcript: fix disfluencies, punctuation,
 and obvious ASR transcription errors, without changing the meaning
 or removing any factual content.
@@ -67,20 +65,18 @@ Transcript:
 
 
 def clean_full_transcript(chunks, client):
-    """Runs cleanup once per meeting, in ~800-word blocks, before summarization."""
     raw_blocks = chunk_text(chunks, max_words=800)
     cleaned_blocks = []
     progress = st.progress(0, text="Cleaning transcript...")
     for i, block in enumerate(raw_blocks):
         cleaned_blocks.append(clean_transcript_chunk(block, client))
+        time.sleep(2)  # avoid Groq free-tier rate limit
         progress.progress((i + 1) / max(len(raw_blocks), 1), text=f"Cleaning section {i+1}/{len(raw_blocks)}")
     progress.empty()
-    return cleaned_blocks  # already chunked at ~800 words, reused directly by summarization
+    return cleaned_blocks
 
 
 def summarize_long_transcript(cleaned_blocks, client):
-    """Map-reduce summarization over the CLEANED transcript blocks."""
-    # MAP step — now with explicit chain-of-thought reasoning for action items
     partial_summaries = []
     progress = st.progress(0, text="Summarizing meeting sections...")
     for i, segment in enumerate(cleaned_blocks):
@@ -102,11 +98,11 @@ Transcript portion:
             temperature=0.3,
         )
         partial_summaries.append(resp.choices[0].message.content)
+        time.sleep(2)  # avoid Groq free-tier rate limit
         progress.progress((i + 1) / max(len(cleaned_blocks), 1), text=f"Summarized section {i+1}/{len(cleaned_blocks)}")
 
     progress.empty()
 
-    # REDUCE step — now with explicit Markdown formatting instruction
     combined = "\n\n".join(f"Part {i+1}:\n{s}" for i, s in enumerate(partial_summaries))
     reduce_prompt = f"""You are given summaries of consecutive parts of one meeting.
 Combine them into a single structured summary with exactly these sections:
@@ -139,7 +135,6 @@ if uploaded_file is not None:
 
     client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-    # --- Stage 1: Transcription ---
     with st.spinner("Transcribing audio..."):
         chunks, raw_transcript, language = transcribe_with_groq("temp_audio.mp3", client)
 
@@ -148,7 +143,6 @@ if uploaded_file is not None:
         st.write(raw_transcript)
     st.caption(f"Detected language: {language} | {len(chunks)} raw segments")
 
-    # --- Stage 2: Transcript Cleanup (NEW) ---
     with st.spinner("Cleaning transcript..."):
         cleaned_blocks = clean_full_transcript(chunks, client)
         cleaned_transcript = " ".join(cleaned_blocks)
@@ -158,7 +152,6 @@ if uploaded_file is not None:
         st.write(cleaned_transcript)
     st.caption("Disfluencies, punctuation, and obvious ASR errors corrected via a dedicated LLM cleanup pass.")
 
-    # --- Stage 3: Summarization (map-reduce, on cleaned transcript) ---
     with st.spinner("Generating structured summary..."):
         summary, num_segments = summarize_long_transcript(cleaned_blocks, client)
 
@@ -166,10 +159,7 @@ if uploaded_file is not None:
     st.subheader("Summary")
     st.markdown(summary)
 
-    # --- Stage 4: RAG Q&A (retrieval still uses cleaned transcript for better chunk quality) ---
-    rag_chunks = chunk_text(cleaned_transcript.split(". "), max_words=150) if False else chunk_text(
-        [c for c in cleaned_transcript.split(". ")], max_words=150
-    )
+    rag_chunks = chunk_text([c for c in cleaned_transcript.split(". ")], max_words=150)
     embedder = load_embedder()
     chunk_embeddings = embedder.encode(rag_chunks)
 
