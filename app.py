@@ -9,6 +9,14 @@ import time
 load_dotenv()
 
 st.set_page_config(page_title="Meeting Notes Summarizer", page_icon="📝")
+st.markdown("""
+<style>
+.block-container { padding-top: 2rem; }
+h1, h2, h3 { font-weight: 700; }
+.stTextInput > div > div > input { border-radius: 8px; }
+[data-testid="stExpander"] { border-radius: 8px; border: 1px solid #2A2E37; }
+</style>
+""", unsafe_allow_html=True)
 st.title("📝 Meeting Notes Summarizer")
 st.write(
     "Upload a meeting audio file to get a cleaned transcript, a structured "
