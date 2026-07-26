@@ -98,7 +98,7 @@ def clean_full_transcript(raw_segments, client):
     progress = st.progress(0, text="Cleaning transcript...")
     for i, block in enumerate(raw_blocks):
         cleaned_blocks.append(clean_transcript_block(block, client))
-        time.sleep(3)
+        time.sleep(1)
         progress.progress((i + 1) / len(raw_blocks), text=f"Cleaning section {i+1}/{len(raw_blocks)}")
     progress.empty()
     return cleaned_blocks
@@ -130,7 +130,7 @@ Transcript portion:
             temperature=0.3,
         )
         partial_summaries.append(resp.choices[0].message.content)
-        time.sleep(3)
+        time.sleep(1)
         progress.progress((i + 1) / len(cleaned_blocks), text=f"Summarized section {i+1}/{len(cleaned_blocks)}")
     progress.empty()
     return partial_summaries
