@@ -15,9 +15,6 @@ st.write(
     "summary, and ask follow-up questions grounded in the meeting content."
 )
 
-# Models: heavy model (70B) only for the final, once-per-meeting reduce step
-# and Q&A; lighter model (8B) for repeated per-chunk calls to stay well
-# within Groq's free-tier per-minute token limits.
 FAST_MODEL = "llama-3.1-8b-instant"
 STRONG_MODEL = "llama-3.3-70b-versatile"
 
@@ -48,7 +45,6 @@ def call_groq_with_retry(client, max_retries=5, **kwargs):
 # HELPERS
 # ============================================================
 def chunk_text(pieces, max_words=800):
-    """Group small text pieces into larger blocks of roughly max_words words."""
     groups, current, word_count = [], [], 0
     for p in pieces:
         current.append(p)
@@ -62,7 +58,7 @@ def chunk_text(pieces, max_words=800):
 
 
 # ============================================================
-# MODULE 1: AUDIO -> TEXT (Speech-to-Text)
+# MODULE 1: SPEECH-TO-TEXT
 # ============================================================
 def transcribe_with_groq(filepath, client):
     with open(filepath, "rb") as audio_file:
@@ -77,7 +73,7 @@ def transcribe_with_groq(filepath, client):
 
 
 # ============================================================
-# MODULE 2: TRANSCRIPT CLEANUP (distinct step, per sir's feedback)
+# MODULE 2: TRANSCRIPT CLEANUP
 # ============================================================
 def clean_transcript_block(raw_block, client):
     prompt = f"""Clean this raw meeting transcript: fix disfluencies ("um", "uh",
@@ -109,10 +105,9 @@ def clean_full_transcript(raw_segments, client):
 
 
 # ============================================================
-# MODULE 3: SUMMARY GENERATOR (map-reduce, chain-of-thought, Markdown)
+# MODULE 3: SUMMARY GENERATOR (map-reduce, CoT, Markdown)
 # ============================================================
 def map_step_summarize(cleaned_blocks, client):
-    """Per-chunk extraction with explicit chain-of-thought reasoning for action items."""
     partial_summaries = []
     progress = st.progress(0, text="Summarizing meeting sections...")
     for i, block in enumerate(cleaned_blocks):
@@ -142,7 +137,6 @@ Transcript portion:
 
 
 def reduce_step_summarize(partial_summaries, client):
-    """Single call, strong model: combine into final Markdown-structured summary."""
     combined = "\n\n".join(f"Part {i+1}:\n{s}" for i, s in enumerate(partial_summaries))
     reduce_prompt = f"""You are given summaries of consecutive parts of one meeting.
 Combine them into a single structured summary with exactly these sections:
@@ -168,15 +162,15 @@ Partial summaries:
 
 
 # ============================================================
-# MODULE 4: RAG Q&A (retrieval-augmented, grounded)
+# MODULE 4: RAG Q&A
 # ============================================================
-def answer_question(question, rag_chunks, chunk_embeddings, embedder, client):
+def answer_question(question, rag_chunks, chunk_embeddings, embedder, client, top_k=5):
     question_embedding = embedder.encode([question])[0]
     similarities = np.dot(chunk_embeddings, question_embedding) / (
         np.linalg.norm(chunk_embeddings, axis=1) * np.linalg.norm(question_embedding)
     )
-    top_k = min(3, len(rag_chunks))
-    top_indices = np.argsort(similarities)[-top_k:][::-1]
+    k = min(top_k, len(rag_chunks))
+    top_indices = np.argsort(similarities)[-k:][::-1]
     relevant_chunks = [rag_chunks[i] for i in top_indices]
     context = "\n".join(relevant_chunks)
 
@@ -198,55 +192,93 @@ Question: {question}
 
 
 # ============================================================
-# MAIN APP
+# PIPELINE RUNNER (runs once per uploaded file, cached in session_state)
 # ============================================================
-uploaded_file = st.file_uploader("Upload audio (mp3/wav/m4a)", type=["mp3", "wav", "m4a"])
+def run_pipeline(filepath, client):
+    raw_segments, raw_transcript, language = transcribe_with_groq(filepath, client)
 
-if uploaded_file is not None:
-    with open("temp_audio.mp3", "wb") as f:
-        f.write(uploaded_file.read())
-
-    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-
-    # --- Module 1: Speech-to-Text ---
-    with st.spinner("Transcribing audio..."):
-        raw_segments, raw_transcript, language = transcribe_with_groq("temp_audio.mp3", client)
     st.subheader("Raw Transcript")
     with st.expander("Show raw transcript"):
         st.write(raw_transcript)
     st.caption(f"Detected language: {language} | {len(raw_segments)} raw segments")
 
-    # --- Module 2: Transcript Cleanup ---
-    with st.spinner("Cleaning transcript..."):
-        cleaned_blocks = clean_full_transcript(raw_segments, client)
-        cleaned_transcript = " ".join(cleaned_blocks)
+    cleaned_blocks = clean_full_transcript(raw_segments, client)
+    cleaned_transcript = " ".join(cleaned_blocks)
+
     st.subheader("Cleaned Transcript")
     with st.expander("Show cleaned transcript"):
         st.write(cleaned_transcript)
     st.caption("Disfluencies, punctuation, and ASR errors corrected via a dedicated LLM cleanup pass.")
 
-    # --- Module 3: Summary Generator (map-reduce) ---
-    with st.spinner("Generating structured summary..."):
-        partial_summaries = map_step_summarize(cleaned_blocks, client)
-        summary = reduce_step_summarize(partial_summaries, client)
-    st.caption(f"Processed transcript in {len(cleaned_blocks)} segment(s) using map-reduce summarization.")
-    st.subheader("Summary")
-    st.markdown(summary)
+    partial_summaries = map_step_summarize(cleaned_blocks, client)
+    summary = reduce_step_summarize(partial_summaries, client)
 
-    # --- Module 4: RAG Q&A setup ---
-    rag_chunks = chunk_text(cleaned_transcript.split(". "), max_words=150)
+    transcript_chunks = chunk_text(cleaned_transcript.split(". "), max_words=150)
+    summary_chunks = chunk_text(summary.split(". "), max_words=150)
+    rag_chunks = transcript_chunks + summary_chunks
     embedder = load_embedder()
     chunk_embeddings = embedder.encode(rag_chunks)
+
+    return {
+        "raw_transcript": raw_transcript,
+        "cleaned_transcript": cleaned_transcript,
+        "summary": summary,
+        "num_segments": len(cleaned_blocks),
+        "rag_chunks": rag_chunks,
+        "chunk_embeddings": chunk_embeddings,
+    }
+
+
+# ============================================================
+# MAIN APP
+# ============================================================
+uploaded_file = st.file_uploader("Upload audio (mp3/wav/m4a)", type=["mp3", "wav", "m4a"])
+
+if uploaded_file is not None:
+    # Only re-run the full pipeline if this is a NEW file, not on every rerun
+    if (
+        "processed_filename" not in st.session_state
+        or st.session_state.processed_filename != uploaded_file.name
+    ):
+        with open("temp_audio.mp3", "wb") as f:
+            f.write(uploaded_file.read())
+
+        client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+        with st.spinner("Processing meeting (transcription, cleanup, summarization)..."):
+            results = run_pipeline("temp_audio.mp3", client)
+
+        st.session_state.processed_filename = uploaded_file.name
+        st.session_state.results = results
+        os.remove("temp_audio.mp3")
+    else:
+        # Already processed this exact file — just re-show cached results, no reprocessing
+        results = st.session_state.results
+        st.subheader("Raw Transcript")
+        with st.expander("Show raw transcript"):
+            st.write(results["raw_transcript"])
+        st.subheader("Cleaned Transcript")
+        with st.expander("Show cleaned transcript"):
+            st.write(results["cleaned_transcript"])
+
+    st.caption(f"Processed transcript in {st.session_state.results['num_segments']} segment(s) using map-reduce summarization.")
+    st.subheader("Summary")
+    st.markdown(st.session_state.results["summary"])
 
     st.subheader("Ask a question about this meeting")
     question = st.text_input("e.g. What did we decide about the budget?")
 
     if question:
+        client = Groq(api_key=os.getenv("GROQ_API_KEY"))
         with st.spinner("Finding the answer..."):
-            answer, relevant_chunks = answer_question(question, rag_chunks, chunk_embeddings, embedder, client)
+            answer, relevant_chunks = answer_question(
+                question,
+                st.session_state.results["rag_chunks"],
+                st.session_state.results["chunk_embeddings"],
+                load_embedder(),
+                client,
+            )
         st.write("**Answer:**", answer)
         with st.expander("Retrieved context used"):
             for chunk in relevant_chunks:
-                st.write("-", chunk)
-
-    os.remove("temp_audio.mp3")
+                st.write("-", chunk) 
