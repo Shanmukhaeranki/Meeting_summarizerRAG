@@ -5,6 +5,7 @@ from sentence_transformers import SentenceTransformer
 import numpy as np
 import os
 import time
+import subprocess
 
 load_dotenv()
 
@@ -25,6 +26,7 @@ st.write(
 
 FAST_MODEL = "llama-3.1-8b-instant"
 STRONG_MODEL = "llama-3.3-70b-versatile"
+GROQ_MAX_BYTES = 24 * 1024 * 1024  # stay safely under Groq's 25MB limit
 
 
 # ============================================================
@@ -66,18 +68,62 @@ def chunk_text(pieces, max_words=800):
 
 
 # ============================================================
-# MODULE 1: SPEECH-TO-TEXT
+# MODULE 1: SPEECH-TO-TEXT (with large-file chunking support)
 # ============================================================
+def split_audio_ffmpeg(filepath, segment_seconds=1200):
+    """Splits a large audio file into ~20-minute, low-bitrate chunks using ffmpeg."""
+    output_pattern = "chunk_%03d.mp3"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", filepath,
+            "-f", "segment", "-segment_time", str(segment_seconds),
+            "-ar", "16000", "-ac", "1", "-b:a", "64k",
+            output_pattern,
+        ],
+        check=True, capture_output=True,
+    )
+    chunk_files = sorted(f for f in os.listdir(".") if f.startswith("chunk_") and f.endswith(".mp3"))
+    return chunk_files
+
+
 def transcribe_with_groq(filepath, client):
-    with open(filepath, "rb") as audio_file:
-        transcription = client.audio.transcriptions.create(
-            file=audio_file,
-            model="whisper-large-v3-turbo",
-            response_format="verbose_json",
-        )
-    raw_segments = [seg["text"].strip() for seg in transcription.segments]
-    raw_transcript = " ".join(raw_segments)
-    return raw_segments, raw_transcript, transcription.language
+    file_size = os.path.getsize(filepath)
+
+    if file_size <= GROQ_MAX_BYTES:
+        with open(filepath, "rb") as audio_file:
+            transcription = client.audio.transcriptions.create(
+                file=audio_file,
+                model="whisper-large-v3-turbo",
+                response_format="verbose_json",
+            )
+        raw_segments = [seg["text"].strip() for seg in transcription.segments]
+        raw_transcript = " ".join(raw_segments)
+        return raw_segments, raw_transcript, transcription.language
+
+    # File too large for a single Groq request — split into chunks first
+    st.info(f"File is {file_size / (1024*1024):.0f}MB — splitting into smaller pieces before transcription...")
+    chunk_files = split_audio_ffmpeg(filepath)
+
+    all_segments = []
+    detected_language = "en"
+    progress = st.progress(0, text="Transcribing large file in parts...")
+    for i, chunk_file in enumerate(chunk_files):
+        with open(chunk_file, "rb") as audio_file:
+            transcription = client.audio.transcriptions.create(
+                file=audio_file,
+                model="whisper-large-v3-turbo",
+                response_format="verbose_json",
+            )
+        chunk_segments = [seg["text"].strip() for seg in transcription.segments]
+        all_segments.extend(chunk_segments)
+        detected_language = transcription.language
+        os.remove(chunk_file)
+        time.sleep(1)
+        progress.progress((i + 1) / len(chunk_files), text=f"Transcribed part {i+1}/{len(chunk_files)}")
+    progress.empty()
+
+    raw_transcript = " ".join(all_segments)
+    return all_segments, raw_transcript, detected_language
 
 
 # ============================================================
@@ -200,7 +246,7 @@ Question: {question}
 
 
 # ============================================================
-# PIPELINE RUNNER (runs once per uploaded file, cached in session_state)
+# PIPELINE RUNNER
 # ============================================================
 def run_pipeline(filepath, client):
     raw_segments, raw_transcript, language = transcribe_with_groq(filepath, client)
@@ -243,11 +289,19 @@ def run_pipeline(filepath, client):
 uploaded_file = st.file_uploader("Upload audio (mp3/wav/m4a)", type=["mp3", "wav", "m4a"])
 
 if uploaded_file is not None:
-    # Only re-run the full pipeline if this is a NEW file, not on every rerun
-    if (
-        "processed_filename" not in st.session_state
-        or st.session_state.processed_filename != uploaded_file.name
-    ):
+    st.audio(uploaded_file, format="audio/mp3")
+
+    already_processed = (
+        "processed_filename" in st.session_state
+        and st.session_state.processed_filename == uploaded_file.name
+    )
+
+    if not already_processed:
+        submitted = st.button("Submit")
+    else:
+        submitted = False
+
+    if submitted:
         with open("temp_audio.mp3", "wb") as f:
             f.write(uploaded_file.read())
 
@@ -259,8 +313,9 @@ if uploaded_file is not None:
         st.session_state.processed_filename = uploaded_file.name
         st.session_state.results = results
         os.remove("temp_audio.mp3")
-    else:
-        # Already processed this exact file — just re-show cached results, no reprocessing
+        already_processed = True
+
+    if already_processed:
         results = st.session_state.results
         st.subheader("Raw Transcript")
         with st.expander("Show raw transcript"):
@@ -269,24 +324,24 @@ if uploaded_file is not None:
         with st.expander("Show cleaned transcript"):
             st.write(results["cleaned_transcript"])
 
-    st.caption(f"Processed transcript in {st.session_state.results['num_segments']} segment(s) using map-reduce summarization.")
-    st.subheader("Summary")
-    st.markdown(st.session_state.results["summary"])
+        st.caption(f"Processed transcript in {results['num_segments']} segment(s) using map-reduce summarization.")
+        st.subheader("Summary")
+        st.markdown(results["summary"])
 
-    st.subheader("Ask a question about this meeting")
-    question = st.text_input("e.g. What did we decide about the budget?")
+        st.subheader("Ask a question about this meeting")
+        question = st.text_input("e.g. What did we decide about the budget?")
 
-    if question:
-        client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-        with st.spinner("Finding the answer..."):
-            answer, relevant_chunks = answer_question(
-                question,
-                st.session_state.results["rag_chunks"],
-                st.session_state.results["chunk_embeddings"],
-                load_embedder(),
-                client,
-            )
-        st.write("**Answer:**", answer)
-        with st.expander("Retrieved context used"):
-            for chunk in relevant_chunks:
-                st.write("-", chunk) 
+        if question:
+            client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+            with st.spinner("Finding the answer..."):
+                answer, relevant_chunks = answer_question(
+                    question,
+                    results["rag_chunks"],
+                    results["chunk_embeddings"],
+                    load_embedder(),
+                    client,
+                )
+            st.write("**Answer:**", answer)
+            with st.expander("Retrieved context used"):
+                for chunk in relevant_chunks:
+                    st.write("-", chunk)
