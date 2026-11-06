@@ -18,3 +18,12 @@ Upload a meeting audio file to get:
 - Summarization: Llama 3.3 70B via Groq API
 - Embeddings/RAG: sentence-transformers (all-MiniLM-L6-v2) + cosine similarity
 - UI: Streamlit
+
+## Contributors
+
+This project was collaboratively developed by:
+
+- **Shanmukha Eranki** – Project development and implementation.
+- **Krishna Vardhan Kondapalli** – Collaborative development, testing, and documentation.
+
+Both contributors worked together to build and improve the Meeting Notes Summarizer.
